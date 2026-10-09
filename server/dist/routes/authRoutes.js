@@ -6,7 +6,7 @@ const router = Router();
 // POST /api/auth/register
 router.post('/register', async (req, res) => {
     try {
-        const { email, password, full_name, role, department, phone } = req.body;
+        const { email, password, full_name, department, phone } = req.body;
         if (!email || !password || !full_name) {
             res.status(400).json({ error: 'Please provide full name, email, and password.' });
             return;
@@ -26,7 +26,7 @@ router.post('/register', async (req, res) => {
             res.status(409).json({ error: 'An account with this email already exists.' });
             return;
         }
-        const userRole = role === 'admin' ? 'admin' : 'student';
+        const userRole = 'student';
         const passwordHash = await bcrypt.hash(password, 10);
         const stmt = db.prepare(`
       INSERT INTO users (email, password_hash, full_name, role, department, phone)

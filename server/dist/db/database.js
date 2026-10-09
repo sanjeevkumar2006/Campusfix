@@ -13,6 +13,7 @@ export const db = new DatabaseSync(dbPath);
 // Enable WAL mode and foreign keys
 db.exec('PRAGMA journal_mode = WAL;');
 db.exec('PRAGMA foreign_keys = ON;');
+db.exec('PRAGMA busy_timeout = 5000;');
 export function initDatabase() {
     const schema = `
     CREATE TABLE IF NOT EXISTS users (
@@ -74,6 +75,13 @@ export function initDatabase() {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS issue_duplicate_confirmations (
+      token_hash TEXT PRIMARY KEY,
+      request_fingerprint TEXT NOT NULL,
+      match_ids TEXT NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS notifications (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
@@ -92,6 +100,7 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status);
     CREATE INDEX IF NOT EXISTS idx_issues_priority ON issues(priority);
     CREATE INDEX IF NOT EXISTS idx_issues_category ON issues(category);
+    CREATE INDEX IF NOT EXISTS idx_duplicate_confirmations_expiry ON issue_duplicate_confirmations(expires_at);
     CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read);
     CREATE INDEX IF NOT EXISTS idx_issue_updates_issue ON issue_updates(issue_id);
   `;
