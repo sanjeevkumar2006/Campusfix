@@ -13,8 +13,8 @@ import {
   Info
 } from 'lucide-react';
 import L from 'leaflet';
-import { api } from '../services/api';
-import type { CampusLocation, IssuePriority, AIAnalysisResult, Issue } from '../types';
+import { ApiRequestError, api } from '../services/api';
+import type { CampusLocation, IssuePriority, AIAnalysisResult, Issue, PotentialDuplicateIssue } from '../types';
 import { useNotifications } from '../context/NotificationContext';
 
 interface ReportIssueModalProps {
@@ -90,8 +90,13 @@ export const ReportIssueModal: React.FC<ReportIssueModalProps> = ({
 
   // Submission & Success Confirmation State
   const [submitting, setSubmitting] = useState<boolean>(false);
+  const [checkingDuplicates, setCheckingDuplicates] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [createdIssue, setCreatedIssue] = useState<Issue | null>(null);
+  const [potentialMatches, setPotentialMatches] = useState<PotentialDuplicateIssue[]>([]);
+  const [duplicateConfirmationToken, setDuplicateConfirmationToken] = useState<string | null>(null);
+  const [showDuplicateReview, setShowDuplicateReview] = useState<boolean>(false);
+  const submissionLockRef = useRef<boolean>(false);
 
   // Load campus locations on open
   useEffect(() => {
@@ -109,6 +114,9 @@ export const ReportIssueModal: React.FC<ReportIssueModalProps> = ({
       stopCamera();
       setCreatedIssue(null);
       setError(null);
+      setPotentialMatches([]);
+      setDuplicateConfirmationToken(null);
+      setShowDuplicateReview(false);
       setSelectedFile(null);
       setPreviewUrl(null);
       setExistingImageUrl(null);
@@ -415,9 +423,98 @@ export const ReportIssueModal: React.FC<ReportIssueModalProps> = ({
     }
   };
 
+  const getDuplicateCandidate = () => ({
+    title: title.trim(),
+    description: description.trim(),
+    category,
+    location_name: locationName.trim(),
+    latitude,
+    longitude
+  });
+
+  const buildSubmissionFormData = (confirmationToken?: string) => {
+    const formData = new FormData();
+    formData.append('title', title.trim());
+    formData.append('description', description.trim());
+    formData.append('category', category);
+    formData.append('priority', priority);
+    formData.append('location_name', locationName);
+
+    if (latitude !== null) formData.append('latitude', latitude.toString());
+    if (longitude !== null) formData.append('longitude', longitude.toString());
+    if (additionalInfo.trim()) formData.append('additional_info', additionalInfo.trim());
+
+    if (aiResult) {
+      formData.append('ai_detected_category', aiResult.suggestedCategory);
+      formData.append('ai_confidence', aiResult.confidence.toString());
+    }
+
+    if (selectedFile) {
+      formData.append('image', selectedFile);
+    } else if (existingImageUrl) {
+      formData.append('existing_image_url', existingImageUrl);
+    }
+
+    if (confirmationToken) {
+      formData.append('duplicate_confirmation_token', confirmationToken);
+    }
+
+    return formData;
+  };
+
+  const showPotentialMatches = (
+    matches: PotentialDuplicateIssue[],
+    confirmationToken?: string
+  ) => {
+    setPotentialMatches(matches);
+    setDuplicateConfirmationToken(confirmationToken || null);
+    setShowDuplicateReview(matches.length > 0);
+    setError(null);
+  };
+
+  const handleContinueAfterReview = async () => {
+    if (submissionLockRef.current || !duplicateConfirmationToken) return;
+
+    submissionLockRef.current = true;
+    setSubmitting(true);
+    setCheckingDuplicates(false);
+    setError(null);
+
+    const candidate = getDuplicateCandidate();
+    try {
+      const res = await api.issues.create(buildSubmissionFormData(duplicateConfirmationToken));
+      setShowDuplicateReview(false);
+      setPotentialMatches([]);
+      setDuplicateConfirmationToken(null);
+      await refreshNotifications();
+      onIssueCreated(res.issue);
+      setCreatedIssue(res.issue);
+    } catch (err: unknown) {
+      if (err instanceof ApiRequestError && err.status === 409) {
+        try {
+          const latestCheck = await api.issues.checkDuplicates(candidate);
+          if (latestCheck.potentialMatches.length > 0) {
+            showPotentialMatches(latestCheck.potentialMatches, latestCheck.confirmationToken);
+          } else {
+            setError(err.message);
+          }
+        } catch (checkError: unknown) {
+          setError(checkError instanceof Error ? checkError.message : 'Failed to refresh possible matches.');
+        }
+      } else {
+        setError(err instanceof Error ? err.message : 'Failed to submit issue report.');
+      }
+    } finally {
+      submissionLockRef.current = false;
+      setSubmitting(false);
+    }
+  };
+
   // Form Submit
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (submissionLockRef.current) return;
+
     if (!previewUrl && !selectedFile && !existingImageUrl) {
       setError('Please capture or select a photo of the incident.');
       return;
@@ -428,40 +525,47 @@ export const ReportIssueModal: React.FC<ReportIssueModalProps> = ({
       return;
     }
 
+    if (!locationName.trim()) {
+      setError('Please select a campus location.');
+      return;
+    }
+
+    submissionLockRef.current = true;
     setSubmitting(true);
+    setCheckingDuplicates(true);
     setError(null);
 
+    const candidate = getDuplicateCandidate();
     try {
-      const formData = new FormData();
-      formData.append('title', title.trim());
-      formData.append('description', description.trim());
-      formData.append('category', category);
-      formData.append('priority', priority);
-      formData.append('location_name', locationName);
-
-      if (latitude) formData.append('latitude', latitude.toString());
-      if (longitude) formData.append('longitude', longitude.toString());
-      if (additionalInfo.trim()) formData.append('additional_info', additionalInfo.trim());
-
-      if (aiResult) {
-        formData.append('ai_detected_category', aiResult.suggestedCategory);
-        formData.append('ai_confidence', aiResult.confidence.toString());
+      const duplicateCheck = await api.issues.checkDuplicates(candidate);
+      if (duplicateCheck.potentialMatches.length > 0) {
+        showPotentialMatches(duplicateCheck.potentialMatches, duplicateCheck.confirmationToken);
+        return;
       }
 
-      if (selectedFile) {
-        formData.append('image', selectedFile);
-      } else if (existingImageUrl) {
-        formData.append('existing_image_url', existingImageUrl);
-      }
-
-      const res = await api.issues.create(formData);
+      const res = await api.issues.create(buildSubmissionFormData());
       await refreshNotifications();
       onIssueCreated(res.issue);
       setCreatedIssue(res.issue);
-    } catch (err: any) {
-      setError(err?.message || 'Failed to submit issue report.');
+    } catch (err: unknown) {
+      if (err instanceof ApiRequestError && err.status === 409) {
+        try {
+          const latestCheck = await api.issues.checkDuplicates(candidate);
+          if (latestCheck.potentialMatches.length > 0) {
+            showPotentialMatches(latestCheck.potentialMatches, latestCheck.confirmationToken);
+          } else {
+            setError(err.message);
+          }
+        } catch (checkError: unknown) {
+          setError(checkError instanceof Error ? checkError.message : 'Failed to refresh possible matches.');
+        }
+      } else {
+        setError(err instanceof Error ? err.message : 'Failed to submit issue report.');
+      }
     } finally {
+      submissionLockRef.current = false;
       setSubmitting(false);
+      setCheckingDuplicates(false);
     }
   };
 
@@ -596,6 +700,68 @@ export const ReportIssueModal: React.FC<ReportIssueModalProps> = ({
           ) : (
             <>
               {error && <div className="alert alert-danger">{error}</div>}
+
+              {showDuplicateReview && potentialMatches.length > 0 && (
+                <div className="alert alert-warning" role="alert" style={{ display: 'block' }}>
+                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px' }}>
+                    <AlertTriangle size={19} style={{ flexShrink: 0, marginTop: '2px' }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <strong>A similar issue may already have been reported.</strong>
+                      <p style={{ margin: '6px 0 12px', fontSize: '0.85rem' }}>
+                        Review these unresolved reports. If your report describes a different problem, you can still submit it.
+                      </p>
+
+                      <div style={{ display: 'grid', gap: '8px' }}>
+                        {potentialMatches.map((match) => (
+                          <div
+                            key={match.issue_code}
+                            style={{
+                              background: 'rgba(255, 255, 255, 0.7)',
+                              border: '1px solid var(--status-pending-border)',
+                              borderRadius: 'var(--radius-sm)',
+                              padding: '10px 12px'
+                            }}
+                          >
+                            <div style={{ fontWeight: 700 }}>
+                              #{match.issue_code} · {match.title}
+                            </div>
+                            <div style={{ marginTop: '4px', fontSize: '0.8rem' }}>
+                              {match.category} · {match.location_name} · {match.status.replace('_', ' ')} ·{' '}
+                              {new Date(match.created_at).toLocaleDateString()}
+                            </div>
+                            <div style={{ marginTop: '3px', fontSize: '0.75rem' }}>
+                              {match.match_reasons.join(' · ')}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '14px' }}>
+                        <button
+                          type="button"
+                          className="btn btn-primary btn-sm"
+                          onClick={handleContinueAfterReview}
+                          disabled={submitting || !duplicateConfirmationToken}
+                        >
+                          {submitting ? 'Submitting...' : 'This is different — submit anyway'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => {
+                            setShowDuplicateReview(false);
+                            setPotentialMatches([]);
+                            setDuplicateConfirmationToken(null);
+                          }}
+                          disabled={submitting}
+                        >
+                          Review or edit my report
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Incident presets quick test bar */}
               <div style={{ marginBottom: '16px' }}>
@@ -1145,7 +1311,7 @@ export const ReportIssueModal: React.FC<ReportIssueModalProps> = ({
                     {submitting ? (
                       <>
                         <RefreshCw size={16} className="animate-spin" />
-                        <span>Submitting Issue...</span>
+                        <span>{checkingDuplicates ? 'Checking for similar reports...' : 'Submitting Issue...'}</span>
                       </>
                     ) : (
                       <>

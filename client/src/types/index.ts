@@ -41,6 +41,16 @@ export interface Issue {
   updates?: IssueUpdate[];
 }
 
+export interface PotentialDuplicateIssue {
+  issue_code: string;
+  title: string;
+  category: string;
+  location_name: string;
+  status: IssueStatus;
+  created_at: string;
+  match_reasons: string[];
+}
+
 export interface IssueUpdate {
   id: number;
   issue_id: number;

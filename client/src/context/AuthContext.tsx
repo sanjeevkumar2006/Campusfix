@@ -22,7 +22,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       const res = await api.auth.getMe();
       setUser(res.user);
-    } catch (err) {
+    } catch {
       removeToken();
       setUser(null);
     } finally {

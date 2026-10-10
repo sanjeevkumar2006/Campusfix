@@ -1,8 +1,10 @@
 import { Router } from 'express';
+import fs from 'node:fs';
 import { db } from '../db/database.js';
 import { requireAuth, requireAdmin } from '../middleware/auth.js';
 import { upload } from '../middleware/upload.js';
 import { NotificationService } from '../services/notificationService.js';
+import { cleanupExpiredDuplicateConfirmations, createDuplicateConfirmation, consumeDuplicateConfirmation, findPotentialDuplicates, parseDuplicateCandidate } from '../services/duplicateDetectionService.js';
 const router = Router();
 // Helper to generate next issue code
 function generateIssueCode() {
@@ -10,15 +12,41 @@ function generateIssueCode() {
     const nextId = (lastRow?.id || 0) + 1;
     return `CF-${1000 + nextId}`;
 }
-// POST /api/issues - Submit a new issue
-router.post('/', requireAuth, upload.single('image'), (req, res) => {
+// POST /api/issues/check-duplicates - Check for unresolved reports before submission
+router.post('/check-duplicates', requireAuth, (req, res) => {
     try {
-        const studentId = req.user.userId;
-        const { title, description, category, priority, location_name, latitude, longitude, ai_detected_category, ai_confidence, existing_image_url, additional_info } = req.body;
-        if (!title || !description || !category || !location_name) {
-            res.status(400).json({ error: 'Please provide Title, Description, Category, and Campus Location.' });
+        const parsed = parseDuplicateCandidate(req.body);
+        if (!parsed.candidate) {
+            res.status(400).json({ error: parsed.error });
             return;
         }
+        cleanupExpiredDuplicateConfirmations(db);
+        const result = findPotentialDuplicates(db, parsed.candidate);
+        const confirmationToken = result.matches.length > 0
+            ? createDuplicateConfirmation(db, parsed.candidate, req.user.userId, result.matchIds)
+            : undefined;
+        res.json({
+            potentialMatches: result.matches,
+            ...(confirmationToken ? { confirmationToken } : {})
+        });
+    }
+    catch (err) {
+        console.error('Duplicate issue check error:', err);
+        res.status(500).json({ error: 'Failed to check for similar campus reports.' });
+    }
+});
+// POST /api/issues - Submit a new issue
+router.post('/', requireAuth, upload.single('image'), (req, res) => {
+    let transactionStarted = false;
+    try {
+        const studentId = req.user.userId;
+        const parsed = parseDuplicateCandidate(req.body);
+        if (!parsed.candidate) {
+            res.status(400).json({ error: parsed.error });
+            return;
+        }
+        const candidate = parsed.candidate;
+        const { priority, ai_detected_category, ai_confidence, existing_image_url, additional_info } = req.body;
         let imageUrl = existing_image_url;
         if (req.file) {
             imageUrl = `/uploads/${req.file.filename}`;
@@ -27,12 +55,34 @@ router.post('/', requireAuth, upload.single('image'), (req, res) => {
             res.status(400).json({ error: 'Please capture or upload a photo of the campus issue.' });
             return;
         }
+        db.exec('BEGIN IMMEDIATE');
+        transactionStarted = true;
+        cleanupExpiredDuplicateConfirmations(db);
+        const duplicateCheck = findPotentialDuplicates(db, candidate);
+        if (duplicateCheck.matches.length > 0) {
+            const confirmed = consumeDuplicateConfirmation(db, req.body.duplicate_confirmation_token, candidate, studentId, duplicateCheck.matchIds);
+            if (!confirmed) {
+                db.exec('ROLLBACK');
+                transactionStarted = false;
+                if (req.file) {
+                    try {
+                        fs.unlinkSync(req.file.path);
+                    }
+                    catch (err) {
+                        console.error('Failed to remove unsubmitted duplicate report image:', err);
+                    }
+                }
+                res.status(409).json({
+                    error: 'A similar issue may already have been reported. Review the potential matches before continuing.',
+                    potentialMatches: duplicateCheck.matches
+                });
+                return;
+            }
+        }
         const issueCode = generateIssueCode();
         const issuePriority = ['low', 'medium', 'high', 'critical'].includes(priority)
             ? priority
             : 'medium';
-        const lat = latitude ? parseFloat(latitude) : null;
-        const lng = longitude ? parseFloat(longitude) : null;
         const conf = ai_confidence ? parseFloat(ai_confidence) : null;
         const stmt = db.prepare(`
       INSERT INTO issues (
@@ -41,7 +91,7 @@ router.post('/', requireAuth, upload.single('image'), (req, res) => {
         latitude, longitude, additional_info, status, created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     `);
-        const result = stmt.run(issueCode, studentId, category.trim(), title.trim(), description.trim(), imageUrl, ai_detected_category || null, conf, issuePriority, location_name.trim(), lat, lng, additional_info?.trim() || null);
+        const result = stmt.run(issueCode, studentId, candidate.category, candidate.title, candidate.description, imageUrl, ai_detected_category || null, conf, issuePriority, candidate.location_name, candidate.latitude, candidate.longitude, additional_info?.trim() || null);
         const issueId = Number(result.lastInsertRowid);
         // Add initial entry to issue_updates timeline
         db.prepare(`
@@ -63,7 +113,7 @@ router.post('/', requireAuth, upload.single('image'), (req, res) => {
             issueId,
             issueCode,
             title: isCritical ? '🚨 Critical Hazard Reported' : 'New Issue Reported',
-            message: `${isCritical ? 'CRITICAL: ' : ''}Issue #${issueCode} (${category}): "${title.trim()}" reported at ${location_name.trim()}`,
+            message: `${isCritical ? 'CRITICAL: ' : ''}Issue #${issueCode} (${candidate.category}): "${candidate.title}" reported at ${candidate.location_name}`,
             type: isCritical ? 'system' : 'status_change'
         });
         const newIssue = db.prepare(`
@@ -72,12 +122,22 @@ router.post('/', requireAuth, upload.single('image'), (req, res) => {
       JOIN users u ON i.student_id = u.id
       WHERE i.id = ?
     `).get(issueId);
+        db.exec('COMMIT');
+        transactionStarted = false;
         res.status(201).json({
             message: 'Issue reported successfully!',
             issue: newIssue
         });
     }
     catch (err) {
+        if (transactionStarted) {
+            try {
+                db.exec('ROLLBACK');
+            }
+            catch (rollbackError) {
+                console.error('Issue creation rollback error:', rollbackError);
+            }
+        }
         console.error('Issue creation error:', err);
         res.status(500).json({ error: 'Failed to create issue. Please check all fields.' });
     }
@@ -86,27 +146,25 @@ router.post('/', requireAuth, upload.single('image'), (req, res) => {
 router.get('/', requireAuth, (req, res) => {
     try {
         const { status, priority, category, location, student_id, search, sort } = req.query;
+        const isAdmin = req.user.role === 'admin';
         let query = `
-      SELECT 
-        i.*,
+      SELECT i.*${isAdmin ? `,
         u.full_name as student_name,
         u.email as student_email,
-        a.full_name as assigned_name
+        a.full_name as assigned_name` : ''}
       FROM issues i
       JOIN users u ON i.student_id = u.id
       LEFT JOIN users a ON i.assigned_to = a.id
       WHERE 1=1
     `;
         const params = [];
-        // Filter by student if requested or if student role wants only their issues
-        if (student_id) {
-            query += ` AND i.student_id = ?`;
-            params.push(Number(student_id));
-        }
-        else if (req.user.role === 'student' && req.query.all !== 'true') {
-            // By default students see their own issues on their dashboard
+        if (!isAdmin) {
             query += ` AND i.student_id = ?`;
             params.push(req.user.userId);
+        }
+        else if (student_id) {
+            query += ` AND i.student_id = ?`;
+            params.push(Number(student_id));
         }
         if (status && status !== 'all') {
             query += ` AND i.status = ?`;
@@ -168,24 +226,21 @@ router.get('/', requireAuth, (req, res) => {
 router.get('/:id', requireAuth, (req, res) => {
     try {
         const issueId = Number(req.params.id);
+        const isAdmin = req.user.role === 'admin';
         const issue = db.prepare(`
-      SELECT 
-        i.*,
+      SELECT i.*${isAdmin ? `,
         u.full_name as student_name,
         u.email as student_email,
-        u.department as student_department,
-        a.full_name as assigned_name,
-        a.email as assigned_email
+        a.full_name as assigned_name` : ''}
       FROM issues i
       JOIN users u ON i.student_id = u.id
       LEFT JOIN users a ON i.assigned_to = a.id
-      WHERE i.id = ?
-    `).get(issueId);
+      WHERE i.id = ?${isAdmin ? '' : ' AND i.student_id = ?'}
+    `).get(...(isAdmin ? [issueId] : [issueId, req.user.userId]));
         if (!issue) {
             res.status(404).json({ error: 'Issue not found.' });
             return;
         }
-        // Role check: students can view their own issues, or public campus issues
         // Load timeline updates
         const updates = db.prepare(`
       SELECT iu.*, u.full_name as user_name, u.role as user_role

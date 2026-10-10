@@ -1,6 +1,22 @@
-import type { Issue, Notification, CampusLocation, CampusStats, User, AdminUser, AIAnalysisResult } from '../types';
+import type { Issue, Notification, CampusLocation, CampusStats, User, AdminUser, AIAnalysisResult, PotentialDuplicateIssue } from '../types';
 
 const API_BASE = '/api';
+
+export class ApiRequestError extends Error {
+  public readonly status: number;
+  public readonly data: Record<string, unknown>;
+
+  constructor(
+    message: string,
+    status: number,
+    data: Record<string, unknown>
+  ) {
+    super(message);
+    this.name = 'ApiRequestError';
+    this.status = status;
+    this.data = data;
+  }
+}
 
 function getToken(): string | null {
   return localStorage.getItem('cf_token');
@@ -38,7 +54,7 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
 
   if (!response.ok) {
     const errorMsg = data?.error || `Request failed with status ${response.status}`;
-    throw new Error(errorMsg);
+    throw new ApiRequestError(errorMsg, response.status, data);
   }
 
   return data as T;
@@ -91,6 +107,22 @@ export const api = {
     },
 
     getById: (id: number) => request<{ issue: Issue }>(`/issues/${id}`),
+
+    checkDuplicates: (candidate: {
+      title: string;
+      description: string;
+      category: string;
+      location_name: string;
+      latitude: number | null;
+      longitude: number | null;
+    }) =>
+      request<{
+        potentialMatches: PotentialDuplicateIssue[];
+        confirmationToken?: string;
+      }>('/issues/check-duplicates', {
+        method: 'POST',
+        body: JSON.stringify(candidate),
+      }),
 
     create: (formData: FormData) =>
       request<{ message: string; issue: Issue }>('/issues', {
